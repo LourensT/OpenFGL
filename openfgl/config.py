@@ -7,14 +7,15 @@ supported_graph_fl_datasets = [
 "AIDS", "BZR", "COLLAB", "COX2", "DD", "DHFR", "ENZYMES", "IMDB-BINARY", "IMDB-MULTI", "MUTAG", "NCI1", "PROTEINS", "PTC_MR", "hERG", "ogbg-molhiv", "ogbg-molpca", "ogbg-ppa", "ogbg-code2"]
 supported_subgraph_fl_datasets = [
 "Cora", "CiteSeer", "PubMed", "CS", "Physics", "Computers", "Photo", "Chameleon", "Squirrel", "ogbn-arxiv", "ogbn-products", "Tolokers", "Actor", \
-"Amazon-ratings", "Roman-empire", "Questions", "Minesweeper", "Reddit", "Flickr"]
+"Amazon-ratings", "Roman-empire", "Questions", "Minesweeper", "Reddit", "Flickr", \
+"AML-Small-HI"]
 
 
 supported_graph_fl_simulations = ["graph_fl_cross_domain", "graph_fl_label_skew", "graph_fl_topology_skew", "graph_fl_feature_skew"]
 supported_subgraph_fl_simulations = ["subgraph_fl_label_skew", "subgraph_fl_louvain_plus", "subgraph_fl_metis_plus", "subgraph_fl_louvain", "subgraph_fl_metis"]
 
 supported_graph_fl_task = ["graph_cls", "graph_reg"]
-supported_subgraph_fl_task = ["node_cls", "link_pred", "node_clust"]
+supported_subgraph_fl_task = ["node_cls", "edge_cls", "link_pred", "node_clust"]
 
 
 supported_fl_algorithm = ["isolate", "fedavg", "fedprox", "scaffold", "moon", "feddc", "fedproto", "fedtgp", "fedpub", "fedstar", "fedgta", "fedtad", "gcfl_plus", "fedsage_plus", "adafgl", "feddep", "fggp", "fgssl", "fedgl"]
@@ -60,7 +61,7 @@ parser.add_argument("--num_clients", type=int, default=10)
 parser.add_argument("--num_rounds", type=int, default=100)
 parser.add_argument("--fl_algorithm", type=str, default="fedavg", choices=supported_fl_algorithm)
 parser.add_argument("--client_frac", type=float, default=1.0)
-
+parser.add_argument("--with_crossedges", type=bool, default=False)
 
 # simulation settings
 parser.add_argument("--simulation_mode", type=str, default="subgraph_fl_louvain", choices=supported_graph_fl_simulations + supported_subgraph_fl_simulations)

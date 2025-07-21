@@ -11,7 +11,6 @@ import numpy as np
 from torch_geometric.utils import coalesce, cumsum, remove_self_loops
 from typing import Dict, List, Optional, Tuple
 
-
 def load_global_dataset(root, scenario, dataset):
     """Load a global dataset based on the given scenario and dataset name.
 
@@ -89,6 +88,12 @@ def load_global_dataset(root, scenario, dataset):
         elif dataset in ["Flickr"]:
             from torch_geometric.datasets import Flickr
             return Flickr(root=osp.join(root, "subgraph_fl", "Flickr"))
+        elif dataset in ["AML-Small-HI"]:
+            from openfgl.data.AML import AMLDataset
+            # TODO make this compatible with the regular root
+            return AMLDataset(root="/mnt/lourens/data/AML", name="Small-HI")
+
+
 
 def cat(seq: List[Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
     values = [v for v in seq if v is not None]

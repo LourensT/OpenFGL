@@ -40,6 +40,35 @@ def load_graph_cls_default_model(args, input_dim, output_dim, client_id=None):
         return GlobalSAG(input_dim=input_dim, hid_dim=args.hid_dim, output_dim=output_dim, num_layers=args.num_layers, dropout=args.dropout)
 
 
+def load_edge_attributed_default_model(args, input_dim_node, input_dim_edge, output_dim, client_id=None):
+    """
+    Load the default model for edge attributed tasks.
+
+    Args:
+        args (Namespace): Arguments containing model configurations.
+        input_dim (int): Dimension of the input features.
+        output_dim (int): Dimension of the output features.
+        client_id (int, optional): ID of the client in federated learning. Defaults to None.
+
+    Returns:
+        torch.nn.Module: The initialized model.
+    """
+    if client_id is None: # server
+        model_name = args.model[0]
+    else: # client
+        if len(args.model) > 1:
+            model_id = int(len(args.model) * client_id / args.num_clients)
+            model_name = args.model[model_id]
+        else:
+            model_name = args.model[0]
+    #  include here
+    if model_name == "gen":
+        from openfgl.model.gen import GEN
+        return GEN(input_dim_node=input_dim_node, input_dim_edge=input_dim_edge, hid_dim=args.hid_dim, output_dim=output_dim, num_layers=args.num_layers, dropout=args.dropout)   
+    else:
+        raise ValueError(f"Model {model_name} is not supported for edge attributed tasks.")
+        # TODO a node_cls model with a single layer for edge classification can be used here too, although edge features are not used in that case.
+
 
 def load_node_edge_level_default_model(args, input_dim, output_dim, client_id=None):
     """

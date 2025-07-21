@@ -118,15 +118,24 @@ class FGLDataset(Dataset):
         Returns:
             Data: The data object for the client.
         """
-        data = torch.load(osp.join(self.processed_dir, "data_{}.pt".format(client_id)))
+        data = torch.load(osp.join(self.processed_dir, "data_{}.pt".format(client_id)), weights_only=False)
         if hasattr(data, "x"):
             data.x = data.x.to(torch.float32)
         if hasattr(data, "y"):
             data.y = data.y.squeeze() # could be int64 (for classification) / float32 (for regression)
-        if hasattr(data, "edge_attr"):
+        
+        if self.args.task == "edge_cls":
+            # Skip this step because removing self-loops is not desirable for edge classification tasks.
+            print("Not removing self-loops for edge classification tasks, because it messes up the labelling and splits.")
+        elif hasattr(data, "edge_attr"):
+            print("Before removing self-loops: edge_index, edge_attr shape:", data.edge_index.shape, data.edge_attr.shape)
             data.edge_index, data.edge_attr = remove_self_loops(*to_undirected(data.edge_index, data.edge_attr))
+            print("After removing self-loops, edge_attr shape:", data.edge_index.shape, data.edge_attr.shape)
         else:
+            print("Before removing self-loops: edge_index shape:", data.edge_index.shape) 
             data.edge_index = remove_self_loops(to_undirected(data.edge_index))[0]
+            print("After removing self-loops: edge_index shape:", data.edge_index.shape)
+
         data.edge_index = data.edge_index.to(torch.int64)
         # reset cache
         data._data_list = None
@@ -139,6 +148,7 @@ class FGLDataset(Dataset):
             data (Data): The data object to be saved.
             client_id (int): The client ID.
         """
+        print("Saving data for client {}...".format(client_id))
         torch.save(data, osp.join(self.processed_dir, "data_{}.pt".format(client_id)))
 
     def process(self):

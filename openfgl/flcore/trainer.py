@@ -35,7 +35,7 @@ class FGLTrainer:
         self.server = load_server(args, fgl_dataset.global_data, fgl_dataset.processed_dir, self.message_pool, self.device)
         
         self.evaluation_result = {"best_round":0}
-        if self.args.task in ["graph_cls", "graph_reg", "node_cls", "link_pred"]:
+        if self.args.task in ["graph_cls", "graph_reg", "node_cls", "link_pred", "edge_cls"]:
             for metric in self.args.metrics:
                 self.evaluation_result[f"best_val_{metric}"] = 0
                 self.evaluation_result[f"best_test_{metric}"] = 0
@@ -79,7 +79,7 @@ class FGLTrainer:
         # download -> local-train -> evaluate on local data
         evaluation_result = {"current_round": self.message_pool["round"]}
         
-        if self.args.task in ["graph_cls", "graph_reg", "node_cls", "link_pred"]:
+        if self.args.task in ["graph_cls", "graph_reg", "node_cls", "link_pred", "edge_cls"]:
             for metric in self.args.metrics:
                 evaluation_result[f"current_val_{metric}"] = 0
                 evaluation_result[f"current_test_{metric}"] = 0
@@ -111,7 +111,7 @@ class FGLTrainer:
                 one_time_infer = True
                 result = self.server.task.evaluate()
             
-            if self.args.task in ["graph_cls", "graph_reg", "node_cls", "link_pred"]:
+            if self.args.task in ["graph_cls", "graph_reg", "node_cls", "link_pred", "edge_cls"]:
                 for metric in self.args.metrics:
                     val_metric, test_metric = result[f"{metric}_val"], result[f"{metric}_test"]
                     evaluation_result[f"current_val_{metric}"] += val_metric * num_samples
@@ -129,7 +129,7 @@ class FGLTrainer:
         
         
         
-        if self.args.task in ["graph_cls", "graph_reg", "node_cls", "link_pred"]:
+        if self.args.task in ["graph_cls", "graph_reg", "node_cls", "link_pred", "edge_cls"]:
             for metric in self.args.metrics:
                 evaluation_result[f"current_val_{metric}"] /= tot_samples
                 evaluation_result[f"current_test_{metric}"] /= tot_samples

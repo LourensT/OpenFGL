@@ -4,6 +4,8 @@ import numpy as np
 import sys
 from collections.abc import Iterable
 
+from openfgl.config import supported_subgraph_fl_task
+
 
 
 def seed_everything(seed):
@@ -223,6 +225,11 @@ def load_task(args, client_id, data, data_dir, device):
     elif args.task == "node_clust":
         from openfgl.task.node_clust import NodeClustTask
         return NodeClustTask(args, client_id, data, data_dir, device)
+    elif args.task == "edge_cls":
+        from openfgl.task.edge_cls import EdgeClsTask
+        return EdgeClsTask(args, client_id, data, data_dir, device)
+    else:
+        raise ValueError(f"Task {args.task} is not supported. Please choose from {supported_subgraph_fl_task}")
     
 
 

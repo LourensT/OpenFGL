@@ -11,7 +11,7 @@ import torch_geometric.utils
 from tqdm import tqdm
 import torch_geometric
 
-def get_subgraph_pyg_data(global_dataset, node_list):
+def get_subgraph_pyg_data(global_dataset, node_list, with_crossedges=False):
     """
     Extract a subgraph from the global dataset given a list of node indices.
 
@@ -22,28 +22,100 @@ def get_subgraph_pyg_data(global_dataset, node_list):
     Returns:
         Data: The subgraph containing the specified nodes and their edges.
     """
+    # check if edge_attr exists
+    if hasattr(global_dataset, "edge_attr"):
+        use_edge_attr = True
+    else:
+        use_edge_attr = False
+
+    if global_dataset.y.shape[0] == global_dataset.x.shape[0]:
+        task = 'node_task'
+    elif global_dataset.y.shape[0] == global_dataset.edge_index.shape[1]:
+        task = 'edge_task'
+    else:
+        raise ValueError("The shape of y does not match the expected shapes for node or edge tasks.")
+
+    print("task:", task)
+
     global_edge_index = global_dataset.edge_index
     node_id_set = set(node_list)
     global_id_to_local_id = {}
     local_id_to_global_id = {}
     local_edge_list = []
+    local_edge_ids = []
     for local_id, global_id in enumerate(node_list):
         global_id_to_local_id[global_id] = local_id
         local_id_to_global_id[local_id] = global_id
         
+    if with_crossedges:
+        # store the index of the cross edges
+        external_nodes_list = []
+
     for edge_id in tqdm(range(global_edge_index.shape[1]), desc="Processing Edge Mapping"):
         src = global_edge_index[0, edge_id].item()
         tgt = global_edge_index[1, edge_id].item()
+    
+        # internal edges
         if src in node_id_set and tgt in node_id_set:
             local_id_src = global_id_to_local_id[src]
             local_id_tgt = global_id_to_local_id[tgt]
             local_edge_list.append((local_id_src, local_id_tgt))
-            
+            if use_edge_attr:
+                local_edge_ids.append(edge_id)
+
+        # cross edges
+        elif with_crossedges and (src in node_id_set or tgt in node_id_set):
+            # one of the nodes is not in the node_list, and we need to give it a local id
+            if not (src in global_id_to_local_id):
+                global_id_to_local_id[src] = len(global_id_to_local_id)
+                local_id_to_global_id[global_id_to_local_id[src]] = src
+                
+                # add it to the external nodes list
+                external_nodes_list.append(src)
+
+            elif not (tgt in global_id_to_local_id):
+                global_id_to_local_id[tgt] = len(global_id_to_local_id)
+                local_id_to_global_id[global_id_to_local_id[tgt]] = tgt
+
+                # add it to the external nodes list
+                external_nodes_list.append(tgt)
+
+            local_id_src = global_id_to_local_id[src] if src in node_id_set else global_id_to_local_id[tgt]
+            local_id_tgt = global_id_to_local_id[tgt] if tgt in node_id_set else global_id_to_local_id[src]
+            local_edge_list.append((local_id_src, local_id_tgt))
+            if use_edge_attr:
+                local_edge_ids.append(edge_id)
+
+    
     local_edge_index = torch.tensor(local_edge_list).T
     
+    if task == 'node_task':
+        new_y = global_dataset.y[node_list]
+    elif task == 'edge_task':
+        new_y = global_dataset.y[local_edge_ids]
     
-    local_subgraph = Data(x=global_dataset.x[node_list], edge_index=local_edge_index, y=global_dataset.y[node_list])
+    print("local_edge_index:", local_edge_index.shape)
+    print("new_y:", new_y.shape)
+
+    if use_edge_attr:
+        local_subgraph = Data(
+            x=global_dataset.x[node_list],
+            edge_index=local_edge_index, 
+            edge_attr=global_dataset.edge_attr[local_edge_ids], 
+            y=new_y
+        )
+    else:
+        local_subgraph = Data(
+            x=global_dataset.x[node_list], 
+            edge_index=local_edge_index, 
+            y=new_y
+        )
+
     local_subgraph.global_map = local_id_to_global_id
+    local_subgraph.global_edge_map = {i : edge_id for i, edge_id in enumerate(local_edge_ids)}
+
+    if with_crossedges:
+        local_subgraph.external_nodes = external_nodes_list
     
     if hasattr(global_dataset, "num_classes"):
         local_subgraph.num_global_classes = global_dataset.num_classes
@@ -198,9 +270,6 @@ def graph_fl_topology_skew(args, global_dataset, shuffle=True):
     return local_data
     
     
-    
-    
-    
   
 def graph_fl_feature_skew(args, global_dataset, shuffle=True):
     """
@@ -324,7 +393,7 @@ def subgraph_fl_label_skew(args, global_dataset, shuffle=True):
     for client_id in range(args.num_clients):
         for class_i in range(K):
             client_label_counts[client_id][class_i] = (node_labels[client_indices[client_id]] == class_i).sum()
-        local_subgraph = get_subgraph_pyg_data(global_dataset, client_indices[client_id])
+        local_subgraph = get_subgraph_pyg_data(global_dataset, client_indices[client_id], with_crossedges=args.with_crossedges)
         if local_subgraph.edge_index.dim() == 1:
             local_subgraph.edge_index, _ = torch_geometric.utils.add_random_edge(local_subgraph.edge_index.view(2,-1))
         local_data.append(local_subgraph)
@@ -380,7 +449,7 @@ def subgraph_fl_louvain_plus(args, global_dataset):
       
     local_data = []
     for client_id in range(args.num_clients):
-        local_subgraph = get_subgraph_pyg_data(global_dataset, client_indices[client_id])
+        local_subgraph = get_subgraph_pyg_data(global_dataset, client_indices[client_id], with_crossedges=args.with_crossedges)
         if local_subgraph.edge_index.dim() == 1:
             local_subgraph.edge_index, _ = torch_geometric.utils.add_random_edge(local_subgraph.edge_index.view(2,-1))
         local_data.append(local_subgraph)
@@ -432,19 +501,12 @@ def subgraph_fl_metis_plus(args, global_dataset):
     
     local_data = []
     for client_id in range(args.num_clients):
-        local_subgraph = get_subgraph_pyg_data(global_dataset, client_indices[client_id])
+        local_subgraph = get_subgraph_pyg_data(global_dataset, client_indices[client_id], with_crossedges=args.with_crossedges)
         if local_subgraph.edge_index.dim() == 1:
             local_subgraph.edge_index, _ = torch_geometric.utils.add_random_edge(local_subgraph.edge_index.view(2,-1))
         local_data.append(local_subgraph)
     
     return local_data
-    
-    
-
-
-
-    
-    
     
 
 def subgraph_fl_metis(args, global_dataset):
@@ -469,7 +531,7 @@ def subgraph_fl_metis(args, global_dataset):
     local_data = []
     
     for client_id in range(args.num_clients):
-        local_subgraph = get_subgraph_pyg_data(global_dataset, client_indices[client_id])
+        local_subgraph = get_subgraph_pyg_data(global_dataset, client_indices[client_id], with_crossedges=args.with_crossedges)
         if local_subgraph.edge_index.dim() == 1:
             local_subgraph.edge_index, _ = torch_geometric.utils.add_random_edge(local_subgraph.edge_index.view(2,-1))
         local_data.append(local_subgraph)
@@ -503,7 +565,7 @@ def subgraph_fl_louvain(args, global_dataset):
     for key in partition.keys():
         if partition[key] not in groups:
             groups.append(partition[key])
-    print(groups)
+    # print(groups)
     partition_groups = {group_i: [] for group_i in groups}
 
     for key in partition.keys():
@@ -517,7 +579,7 @@ def subgraph_fl_louvain(args, global_dataset):
             new_grp_i = max(groups) + 1
             groups.append(new_grp_i)
             partition_groups[new_grp_i] = long_group[group_len_max:]
-    print(groups)
+    # print(groups)
 
     len_list = []
     for group_i in groups:
@@ -568,7 +630,7 @@ def subgraph_fl_louvain(args, global_dataset):
 
     local_data = []
     for client_id in range(args.num_clients):
-        local_subgraph = get_subgraph_pyg_data(global_dataset, owner_node_ids[client_id])
+        local_subgraph = get_subgraph_pyg_data(global_dataset, owner_node_ids[client_id], with_crossedges=args.with_crossedges)
         if local_subgraph.edge_index.dim() == 1:
             local_subgraph.edge_index, _ = torch_geometric.utils.add_random_edge(local_subgraph.edge_index.view(2,-1))
         local_data.append(local_subgraph)

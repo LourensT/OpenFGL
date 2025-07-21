@@ -53,6 +53,9 @@ def compute_supervised_metrics(metrics, logits, labels, suffix):
     if "f1" in metrics:
         result[f"f1_{suffix}"] = f1_score(np_labels, preds, average='weighted')
         
+    if "f1_minority" in metrics:
+        result[f"f1_minority_{suffix}"] = f1_score(np_labels, preds, average='binary', pos_label=1) if np_labels.max() == 1 else f1_score(np_labels, preds, average='micro')
+
     if "auc" in metrics:
         if np_labels.max() > 1:
             raise ValueError("AUC is not directly supported for multi-class classification.")
