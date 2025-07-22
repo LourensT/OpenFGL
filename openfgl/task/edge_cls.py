@@ -12,6 +12,7 @@ import numpy as np
 from openfgl.utils.privacy_utils import clip_gradients, add_noise
 from openfgl.data.processing import processing
 from typing import Tuple, Union, List
+from torch_geometric.loader import LinkNeighborLoader
 
 class EdgeClsTask(BaseTask):
     """
@@ -38,14 +39,94 @@ class EdgeClsTask(BaseTask):
         """
         Train the model on the processed data.
         """
+        if self.args.use_batch_loading:
+            print("training with batch loading")
+            self.train_with_batch_loading()
+        else:
+            self.train_without_batch_loading()
+    
+    def train_with_batch_loading(self):
+        """
+        Train the model using batch loading with LinkNeighborLoader.
+        """
+        data = self.processed_data["data"]  # Use processed data for training
+        train_mask = self.processed_data["train_mask"] 
+
+        self.model.train()
+
+        # Get the indices of training edges
+        train_edge_indices = train_mask.nonzero(as_tuple=False).squeeze(1)
+        
+        # TODO we could use 'edge_label_time' here when we want to inductive learning. 
+        # Requires time_attr to be set too. See doc.
+        # Also we still need to make sure train_mask is set for indutive learning.
+        loader = LinkNeighborLoader(
+            data,
+            edge_label_index=data.edge_index[:, train_edge_indices],
+            edge_label=data.y[train_edge_indices],
+            batch_size=self.args.batch_size,
+            shuffle=True,
+            num_neighbors=self.args.num_neighbors,
+            num_workers=0,  # Single-threaded to avoid issues
+        )
+
+        for _ in range(self.args.num_epochs):
+            
+            for batchidx, batch in enumerate(loader):
+                if batchidx > self.args.iterations_per_epoch:
+                    break
+
+                # Move batch to device
+                batch = batch.to(self.device)
+
+                # 
+                self.optim.zero_grad()
+
+                # not all the target edges will be sampled in the batch graph, but we only want those.
+                # TODO would it be more robust if we guarantee that the edges in batch.input_id are always in the batch.e_id?
+                # TODO it is more common to put this in the model, but we do it here so that we can easier use node models.
+                mask_logits = torch.isin(batch.e_id, train_edge_indices[batch.input_id])
+                mask_labels = torch.isin(train_edge_indices[batch.input_id], batch.e_id)
+                assert mask_logits.sum() == mask_labels.sum(), "mask_logits sum should match mask_labels sum"
+                print(f"mask shape: {mask_logits.shape}, mask sum: {mask_logits.sum()}")
+
+                # if more than 10% of the edges are not in the mask, raise an error
+                if mask_logits.sum() < 0.9 * batch.input_id.shape[0]:
+                    raise ValueError("More than 10% of the edges are not in the mask. This should not happen, as input_id should be the edges in the batch.")
+
+                # node_embeddings and edge_logits for full batch graph
+                node_embeddings, edge_logits = self.model.forward(batch)
+
+                # logits here are the logits for all edges in the graph, so we need to filter them using the mask
+                labeled_logits = edge_logits[mask_logits]  # Get logits for the edges in the batch
+
+                # TODO use self.loss_fn instead of default_loss_fn
+                loss_train = self.default_loss_fn(labeled_logits, batch.edge_label[mask_labels])
+
+                if self.args.dp_mech != "no_dp":
+                    # clip the gradient of each sample in this batch
+                    clip_gradients(self.model, loss_train, loss_train.shape[0], self.args.dp_mech, self.args.grad_clip)
+                else:
+                    loss_train.backward()
+
+                if self.step_preprocess is not None:
+                    self.step_preprocess()
+
+                self.optim.step()
+
+                if self.args.dp_mech != "no_dp":
+                    # add noise to parameters
+                    add_noise(self.args, self.model, loss_train.shape[0])
+
+    def train_without_batch_loading(self):
+        """
+        Train the model on the processed data.
+        """
         splitted_data = self.processed_data # use processed_data to train model
 
         self.model.train()
         for _ in range(self.args.num_epochs):
             self.optim.zero_grad()
-
-            # TODO - the AML graph is so large that we cannot load it all in memory and instead need to use torch_gemoetric.LinkLoader
-            # TODO this is a transductive split, so we use the whole graph (including test examples)
 
             # the node_embeddings are in fact node logits
             node_embeddings, edge_logits = self.model.forward(splitted_data["data"]) 
@@ -68,6 +149,106 @@ class EdgeClsTask(BaseTask):
                 add_noise(self.args, self.model, loss_train.shape[0])
 
     def evaluate(self, mute=False):
+        """
+        Evaluate the model on all splits (train, validation, test).
+
+        Returns:
+            dict: Evaluation metrics 
+        """
+        if self.args.use_batch_loading:
+            return self.evaluate_with_batch_loading(mute)
+        else:
+            return self.evaluate_without_batch_loading(mute)
+    
+    def evaluate_with_batch_loading(self, mute=False):
+        """
+        Evaluate the model using batch loading with LinkNeighborLoader.
+
+        Returns:
+            dict: Evaluation metrics 
+        """
+        splitted_data = self.processed_data
+
+        if self.override_evaluate is not None:
+            return self.override_evaluate(splitted_data)
+    
+        eval_output = {}
+        self.model.eval()
+        with torch.no_grad():
+            split_examples = 0
+            for split in ["train", "val", "test"]:
+                split_mask = splitted_data[f"{split}_mask"]
+                data = splitted_data["data"]
+                split_edge_indices = split_mask.nonzero(as_tuple=False).squeeze(1)
+
+
+                eval_output[f"loss_{split}"] = 0
+
+
+                loader = LinkNeighborLoader(
+                    data,
+                    edge_label_index=data.edge_index[:, split_edge_indices],
+                    edge_label=data.y[split_edge_indices],
+                    batch_size=self.args.batch_size,
+                    shuffle=True,
+                    num_neighbors=self.args.num_neighbors,
+                    num_workers=0,  # Single-threaded to avoid issues
+                )
+                for batchidx, batch in enumerate(loader):
+                    if batchidx > self.args.iterations_per_epoch:
+                        break
+                    # Move batch to device
+                    batch = batch.to(self.device)
+
+                    # node_embeddings and edge_logits for full batch graph
+                    node_embeddings, edge_logits = self.model.forward(batch)
+
+                    # logits here are the logits for all edges in the graph, so we need to filter them using the mask
+                    mask_logits = torch.isin(batch.e_id, split_edge_indices[batch.input_id])
+                    mask_labels = torch.isin(split_edge_indices[batch.input_id], batch.e_id)
+                    labeled_logits = edge_logits[mask_logits]
+                    labeled_labels = batch.edge_label[mask_labels]
+
+                    loss = self.default_loss_fn(labeled_logits, labeled_labels)
+
+                    eval_output[f"loss_{split}"] += loss.item()
+
+                    # update the metrics proportional to number of samples
+                    num_samples = labeled_logits.shape[0]
+                    split_examples += num_samples
+
+                    metrics = compute_supervised_metrics(
+                        metrics=self.args.metrics,
+                        logits=labeled_logits,
+                        labels=labeled_labels,
+                        suffix=split,
+                    )
+
+                    for key, value in metrics.items():
+                        if key in eval_output:
+                            eval_output[key] += value * num_samples
+                        else:
+                            eval_output[key] = value * num_samples
+
+                # eval_output[f"loss_{split}"] /= len(loader)
+                for key, value in eval_output.items():
+                    if key.startswith("loss_"):
+                        continue
+                    eval_output[key] /= split_examples
+
+        info = ""
+        for key, val in eval_output.items():
+            try:
+                info += f"\t{key}: {val:.4f}"
+            except:
+                continue
+
+        prefix = f"[client {self.client_id}]" if self.client_id is not None else "[server]"
+        if not mute:
+            print(prefix+info)
+        return eval_output
+
+    def evaluate_without_batch_loading(self, mute=False):
         """
         Evaluate the model on all splits (train, validation, test).
 

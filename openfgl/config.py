@@ -83,6 +83,9 @@ parser.add_argument("--lr", type=float, default=1e-2)
 parser.add_argument("--optim", type=str, default="adam")
 parser.add_argument("--weight_decay", type=float, default=5e-4)
 parser.add_argument("--batch_size", type=int, default=128)
+parser.add_argument("--iterations_per_epoch", type=int, default=None, help="Number of iterations per epoch for batch processing. If None, computed based on dataset size.")
+parser.add_argument("--num_neighbors", type=int, default=[10, 5], nargs='+', help="Number of neighbors to sample for each layer in LinkNeighborLoader")
+parser.add_argument("--use_batch_loading", action='store_true', help="Use batch loading with LinkNeighborLoader for large graphs")
 
 
 # model settings
