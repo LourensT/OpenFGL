@@ -3,7 +3,7 @@ import random
 from openfgl.data.distributed_dataset_loader import FGLDataset
 from openfgl.utils.basic_utils import load_client, load_server
 from openfgl.utils.logger import Logger
-
+from openfgl.utils.wanb import wandb_run
 
 class FGLTrainer:
     """
@@ -33,7 +33,7 @@ class FGLTrainer:
         self.device = torch.device(f"cuda:{args.gpuid}" if (torch.cuda.is_available() and args.use_cuda) else "cpu")
         self.clients = [load_client(args, client_id, fgl_dataset.local_data[client_id], fgl_dataset.processed_dir, self.message_pool, self.device) for client_id in range(self.args.num_clients)]
         self.server = load_server(args, fgl_dataset.global_data, fgl_dataset.processed_dir, self.message_pool, self.device)
-        
+
         self.evaluation_result = {"best_round":0}
         if self.args.task in ["graph_cls", "graph_reg", "node_cls", "link_pred", "edge_cls"]:
             for metric in self.args.metrics:
@@ -43,7 +43,7 @@ class FGLTrainer:
             for metric in self.args.metrics:
                 self.evaluation_result[f"best_{metric}"] = 0
         
-
+        wandb_run.add_config(args)  # Initialize wandb with the configuration
         self.logger = Logger(args, self.message_pool, fgl_dataset.processed_dir, self.server.personalized)
         
   
@@ -167,9 +167,5 @@ class FGLTrainer:
             print(best_output)
             
         self.logger.add_log(evaluation_result)
-            
+        wandb_run.log(evaluation_result)  # Log the evaluation results to wandb
     
-        
-        
-        
-     

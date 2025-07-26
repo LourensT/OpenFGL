@@ -1,18 +1,20 @@
 import torch
 import torch.nn as nn
-from openfgl.task.base import BaseTask
-from openfgl.utils.basic_utils import extract_floats, idx_to_mask_tensor, mask_tensor_to_idx
-from os import path as osp
-from openfgl.utils.metrics import compute_supervised_metrics
+from torch_geometric.loader import LinkNeighborLoader
 import os
-import torch
-from openfgl.utils.task_utils import load_edge_attributed_default_model
+from os import path as osp
 import pickle
 import numpy as np
+from typing import Tuple
+
+from openfgl.task.base import BaseTask
+from openfgl.utils.basic_utils import extract_floats, idx_to_mask_tensor, mask_tensor_to_idx
+from openfgl.utils.task_utils import load_edge_attributed_default_model
+from openfgl.utils.wanb import wandb_run
+from openfgl.utils.metrics import compute_supervised_metrics
 from openfgl.utils.privacy_utils import clip_gradients, add_noise
 from openfgl.data.processing import processing
-from typing import Tuple, Union, List
-from torch_geometric.loader import LinkNeighborLoader
+
 
 class EdgeClsTask(BaseTask):
     """
@@ -79,16 +81,14 @@ class EdgeClsTask(BaseTask):
                 # Move batch to device
                 batch = batch.to(self.device)
 
-                # 
+                # reset gradients
                 self.optim.zero_grad()
 
                 # not all the target edges will be sampled in the batch graph, but we only want those.
-                # TODO would it be more robust if we guarantee that the edges in batch.input_id are always in the batch.e_id?
                 # TODO it is more common to put this in the model, but we do it here so that we can easier use node models.
                 mask_logits = torch.isin(batch.e_id, train_edge_indices[batch.input_id])
                 mask_labels = torch.isin(train_edge_indices[batch.input_id], batch.e_id)
                 assert mask_logits.sum() == mask_labels.sum(), "mask_logits sum should match mask_labels sum"
-                print(f"mask shape: {mask_logits.shape}, mask sum: {mask_logits.sum()}")
 
                 # if more than 10% of the edges are not in the mask, raise an error
                 if mask_logits.sum() < 0.9 * batch.input_id.shape[0]:
@@ -113,6 +113,8 @@ class EdgeClsTask(BaseTask):
                     self.step_preprocess()
 
                 self.optim.step()
+
+                print(f"[client {self.client_id}] Epoch: {_+1}/{self.args.num_epochs}, Batch: {batchidx+1}/{len(loader)}, Loss: {loss_train.item():.4f}")
 
                 if self.args.dp_mech != "no_dp":
                     # add noise to parameters
@@ -141,6 +143,7 @@ class EdgeClsTask(BaseTask):
                 loss_train.backward()
 
             if self.step_preprocess is not None:
+                # TODO we need to schedule learning rate
                 self.step_preprocess()
 
             self.optim.step()
@@ -156,9 +159,14 @@ class EdgeClsTask(BaseTask):
             dict: Evaluation metrics 
         """
         if self.args.use_batch_loading:
-            return self.evaluate_with_batch_loading(mute)
+            evals = self.evaluate_with_batch_loading(mute)
         else:
-            return self.evaluate_without_batch_loading(mute)
+            evals = self.evaluate_without_batch_loading(mute)
+
+        # log to wandb
+        # TODO need a way to add the round 
+        wandb_run.log( evals )
+        return evals
     
     def evaluate_with_batch_loading(self, mute=False):
         """
@@ -243,7 +251,7 @@ class EdgeClsTask(BaseTask):
             except:
                 continue
 
-        prefix = f"[client {self.client_id}]" if self.client_id is not None else "[server]"
+        prefix = f"[client_{self.client_id}]" if self.client_id is not None else "[server]"
         if not mute:
             print(prefix+info)
         return eval_output
@@ -316,13 +324,15 @@ class EdgeClsTask(BaseTask):
         Returns:
             torch.nn.Module: Default model.
         """
-        return load_edge_attributed_default_model(
+        model = load_edge_attributed_default_model(
             self.args,
             input_dim_node=self.num_feats[0],
             input_dim_edge=self.num_feats[1],
             output_dim=self.num_global_classes,
             client_id=self.client_id
         )
+        print(f"loaded model: {model}")
+        return model
 
     @property
     def default_optim(self):
@@ -378,7 +388,9 @@ class EdgeClsTask(BaseTask):
         if self.args.dp_mech != "no_dp":
             return nn.CrossEntropyLoss(reduction="none")
         else:
-            return nn.CrossEntropyLoss()
+            # TODO parametrize this
+            # return nn.BCEWithLogitsLoss(weight=torch.tensor([1,7], device=self.device))
+            return nn.CrossEntropyLoss(weight=torch.tensor([1, 7], device=self.device, dtype=torch.float32))
 
     @property
     def default_train_val_test_split(self):

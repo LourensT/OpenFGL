@@ -65,6 +65,9 @@ def load_edge_attributed_default_model(args, input_dim_node, input_dim_edge, out
     if model_name == "gen":
         from openfgl.model.gen import GEN
         return GEN(input_dim_node=input_dim_node, input_dim_edge=input_dim_edge, hid_dim=args.hid_dim, output_dim=output_dim, num_layers=args.num_layers, dropout=args.dropout)   
+    elif model_name == "gine":
+        from openfgl.model.gine import GINe
+        return GINe(input_dim_node=input_dim_node, input_dim_edge=input_dim_edge, hid_dim=args.hid_dim, num_mp_layers=args.num_layers, output_dim=output_dim) 
     else:
         raise ValueError(f"Model {model_name} is not supported for edge attributed tasks.")
         # TODO a node_cls model with a single layer for edge classification can be used here too, although edge features are not used in that case.

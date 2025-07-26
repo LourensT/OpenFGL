@@ -63,3 +63,7 @@ class GEN(nn.Module):
         
         # print shapes of x, edge_index, edge_attr
         return x, edge_attr
+    
+    def __repr__(self):
+        total_params = sum(p.numel() for p in self.parameters())
+        return f"GEN(input_dim_node={self.node_encoder.in_features}, input_dim_edge={self.edge_encoder.in_features}, hid_dim={self.mp_layers[0].in_channels}, output_dim={self.lin[-1].out_features}, num_layers={self.num_layers}, num_parameters={total_params})"
