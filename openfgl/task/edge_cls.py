@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.loader import LinkNeighborLoader
 import os
 from os import path as osp
 import pickle
 import numpy as np
 from typing import Tuple
+from torch_geometric.data import Data
 
 from openfgl.task.base import BaseTask
 from openfgl.utils.basic_utils import extract_floats, idx_to_mask_tensor, mask_tensor_to_idx
@@ -42,7 +44,6 @@ class EdgeClsTask(BaseTask):
         Train the model on the processed data.
         """
         if self.args.use_batch_loading:
-            print("training with batch loading")
             self.train_with_batch_loading()
         else:
             self.train_without_batch_loading()
@@ -56,21 +57,53 @@ class EdgeClsTask(BaseTask):
 
         self.model.train()
 
-        # Get the indices of training edges
-        train_edge_indices = train_mask.nonzero(as_tuple=False).squeeze(1)
-        
-        # TODO we could use 'edge_label_time' here when we want to inductive learning. 
-        # Requires time_attr to be set too. See doc.
-        # Also we still need to make sure train_mask is set for indutive learning.
-        loader = LinkNeighborLoader(
-            data,
-            edge_label_index=data.edge_index[:, train_edge_indices],
-            edge_label=data.y[train_edge_indices],
-            batch_size=self.args.batch_size,
-            shuffle=True,
-            num_neighbors=self.args.num_neighbors,
-            num_workers=0,  # Single-threaded to avoid issues
-        )
+        if self.args.split_mode == "inductive":
+            
+            # 
+            # Create the graph corresponding to the current split
+            # - contains all edges from this and previous splits
+            # - contains a mask for the edge labels that in this split
+            split_graph_mask = train_mask # This is redundant, but keeps structure consistent with evaluate method TODO move into sep method
+            assert split_graph_mask.shape[0] == data.edge_index.shape[1], "The split graph mask should have the same number of edges as the original graph."
+            # Get the indices of the edges in the split graph
+            train_graph_indices = split_graph_mask.nonzero(as_tuple=False).squeeze(1)
+
+            # realign train_mask with the new split graph mask
+            train_edge_indices = train_mask[split_graph_mask].nonzero(as_tuple=False).squeeze(1)
+            # assert that this is all one's
+            assert train_edge_indices.shape[0] == train_graph_indices.shape[0], "The number of edges in the train mask should match the number of edges in the split graph mask."
+
+            # create the training graph (that contains only the training edges)
+            train_data = Data(
+                x=data.x,
+                edge_index=data.edge_index[:, train_graph_indices],
+                edge_attr=data.edge_attr[train_graph_indices],
+                y=data.y[train_graph_indices],
+                timestamps=data.timestamps[train_graph_indices],
+            )
+
+            loader = LinkNeighborLoader(
+                train_data,
+                edge_label_index=train_data.edge_index[:, train_edge_indices],
+                edge_label=train_data.y[train_edge_indices],
+                batch_size=self.args.batch_size,
+                num_neighbors=self.args.num_neighbors,
+                num_workers=0,  # Single-threaded to avoid issues
+                shuffle=True,
+            )
+
+        elif self.args.split_mode == "transductive":
+            loader = LinkNeighborLoader(
+                data,
+                edge_label_index=data.edge_index[:, train_edge_indices],
+                edge_label=data.y[train_edge_indices],
+                batch_size=self.args.batch_size,
+                shuffle=True,
+                num_neighbors=self.args.num_neighbors,
+                num_workers=0,  # Single-threaded to avoid issues
+            )
+        else:
+            raise ValueError(f"Unknown split mode: {self.args.split_mode}. Supported modes are 'inductive' and 'transductive'.")
 
         for _ in range(self.args.num_epochs):
             
@@ -80,28 +113,30 @@ class EdgeClsTask(BaseTask):
 
                 # Move batch to device
                 batch = batch.to(self.device)
+                train_edge_indices = train_edge_indices.to(self.device)
 
                 # reset gradients
                 self.optim.zero_grad()
 
-                # not all the target edges will be sampled in the batch graph, but we only want those.
-                # TODO it is more common to put this in the model, but we do it here so that we can easier use node models.
-                mask_logits = torch.isin(batch.e_id, train_edge_indices[batch.input_id])
-                mask_labels = torch.isin(train_edge_indices[batch.input_id], batch.e_id)
-                assert mask_logits.sum() == mask_labels.sum(), "mask_logits sum should match mask_labels sum"
+                # node_embeddings and edge_logits for full batch graph (not just the sampled edges)
+                node_embeddings, edge_logits = self.model.forward(batch)
 
+                # Create a mask for the edges in the batch
+                mask_logits = torch.isin(batch.e_id, train_edge_indices[batch.input_id])
+                # Create a mask for the labels
+                mask_labels = torch.isin(train_edge_indices[batch.input_id], batch.e_id)
+
+                # sanity checks
+                assert mask_logits.sum() == mask_labels.sum(), f"mask_logits ({mask_logits.sum()}) sum should match mask_labels sum (P{mask_labels.sum()})"
                 # if more than 10% of the edges are not in the mask, raise an error
                 if mask_logits.sum() < 0.9 * batch.input_id.shape[0]:
-                    raise ValueError("More than 10% of the edges are not in the mask. This should not happen, as input_id should be the edges in the batch.")
-
-                # node_embeddings and edge_logits for full batch graph
-                node_embeddings, edge_logits = self.model.forward(batch)
+                    raise ValueError(f"More than 10% of the edges are not in the mask, {mask_logits.sum()} < {0.9 * batch.input_id.shape[0]}")
 
                 # logits here are the logits for all edges in the graph, so we need to filter them using the mask
                 labeled_logits = edge_logits[mask_logits]  # Get logits for the edges in the batch
-
+                target_labels = batch.edge_label[mask_labels].unsqueeze(1) # Get labels for the edges in the batc, as floats
                 # TODO use self.loss_fn instead of default_loss_fn
-                loss_train = self.default_loss_fn(labeled_logits, batch.edge_label[mask_labels])
+                loss_train, pred = self.default_loss_fn(labeled_logits, target_labels)
 
                 if self.args.dp_mech != "no_dp":
                     # clip the gradient of each sample in this batch
@@ -114,7 +149,7 @@ class EdgeClsTask(BaseTask):
 
                 self.optim.step()
 
-                print(f"[client {self.client_id}] Epoch: {_+1}/{self.args.num_epochs}, Batch: {batchidx+1}/{len(loader)}, Loss: {loss_train.item():.4f}")
+                # print(f"[client {self.client_id}] Epoch: {_+1}/{self.args.num_epochs}, Batch: {batchidx+1}/{len(loader)}, Loss: {loss_train.item():.4f}")
 
                 if self.args.dp_mech != "no_dp":
                     # add noise to parameters
@@ -125,6 +160,9 @@ class EdgeClsTask(BaseTask):
         Train the model on the processed data.
         """
         splitted_data = self.processed_data # use processed_data to train model
+
+        if self.args.split_mode == "inductive":
+            raise NotImplementedError("Batch loading is required for inductive learning. Please set args.use_batch_loading to True.")
 
         self.model.train()
         for _ in range(self.args.num_epochs):
@@ -164,7 +202,7 @@ class EdgeClsTask(BaseTask):
             evals = self.evaluate_without_batch_loading(mute)
 
         # log to wandb
-        # TODO need a way to add the round 
+        # TODO need a way to add the round here
         wandb_run.log( evals )
         return evals
     
@@ -184,24 +222,69 @@ class EdgeClsTask(BaseTask):
         self.model.eval()
         with torch.no_grad():
             split_examples = 0
-            for split in ["train", "val", "test"]:
-                split_mask = splitted_data[f"{split}_mask"]
-                data = splitted_data["data"]
-                split_edge_indices = split_mask.nonzero(as_tuple=False).squeeze(1)
+            splits = ["train", "val", "test"]
+            for i, split in enumerate(splits):
 
+                data = splitted_data["data"]
 
                 eval_output[f"loss_{split}"] = 0
 
+                if self.args.split_mode == "inductive":
 
-                loader = LinkNeighborLoader(
-                    data,
-                    edge_label_index=data.edge_index[:, split_edge_indices],
-                    edge_label=data.y[split_edge_indices],
-                    batch_size=self.args.batch_size,
-                    shuffle=True,
-                    num_neighbors=self.args.num_neighbors,
-                    num_workers=0,  # Single-threaded to avoid issues
-                )
+                    # Create the graph corresponding to the current split
+                    # - contains all edges from this and previous splits
+                    # - contains a mask for the edge labels that in this split
+                    split_graph_mask = torch.any(torch.stack([splitted_data[f"{splits[j]}_mask"] for j in range(i+1)]), dim=0)
+                    assert split_graph_mask.shape[0] == data.edge_index.shape[1], "The split graph mask should have the same number of edges as the original graph."
+
+                    # Get the mask for the current split
+                    split_mask = splitted_data[f"{split}_mask"]
+                    # realign split_mask with the new split graph mask
+                    split_mask = split_mask[split_graph_mask]
+                    split_edge_indices = split_mask.nonzero(as_tuple=False).squeeze(1)
+
+                    # Get the indices of the edges in the split graph
+                    split_graph_indices = split_graph_mask.nonzero(as_tuple=False).squeeze(1)
+                    assert split != "test" or len(split_graph_indices) == len(splitted_data["data"].edge_index[0]), \
+                        f"Test split should contain all edges, but found {len(split_graph_indices)} edges instead of {len(splitted_data['data'].edge_index[0])}."
+
+                    # create the split graph
+                    split_data = Data(
+                        x=data.x,
+                        edge_index=data.edge_index[:, split_graph_indices],
+                        edge_attr=data.edge_attr[split_graph_indices],
+                        y=data.y[split_graph_indices],
+                        timestamps=data.timestamps[split_graph_indices],
+                    )
+
+                    # create the loader for the split graph
+                    loader = LinkNeighborLoader(
+                        split_data,
+                        edge_label_index=split_data.edge_index[:, split_edge_indices],
+                        edge_label=split_data.y[split_edge_indices],
+                        batch_size=self.args.batch_size,
+                        shuffle=True,
+                        num_neighbors=self.args.num_neighbors,
+                        num_workers=0,  # Single-threaded to avoid issues
+                    )
+
+                elif self.args.split_mode == "transductive":
+                    # Get the mask for the current split
+                    split_mask = splitted_data[f"{split}_mask"] 
+                    split_edge_indices = split_mask.nonzero(as_tuple=False).squeeze(1) #
+
+                    loader = LinkNeighborLoader(
+                        data,
+                        edge_label_index=data.edge_index[:, split_edge_indices],
+                        edge_label=data.y[split_edge_indices],
+                        batch_size=self.args.batch_size,
+                        shuffle=True,
+                        num_neighbors=self.args.num_neighbors,
+                        num_workers=0,  # Single-threaded to avoid issues
+                    )
+                else:
+                    raise ValueError(f"Unknown split mode: {self.args.split_mode}. Supported modes are 'inductive' and 'transductive'.")
+
                 for batchidx, batch in enumerate(loader):
                     if batchidx > self.args.iterations_per_epoch:
                         break
@@ -212,12 +295,34 @@ class EdgeClsTask(BaseTask):
                     node_embeddings, edge_logits = self.model.forward(batch)
 
                     # logits here are the logits for all edges in the graph, so we need to filter them using the mask
-                    mask_logits = torch.isin(batch.e_id, split_edge_indices[batch.input_id])
-                    mask_labels = torch.isin(split_edge_indices[batch.input_id], batch.e_id)
-                    labeled_logits = edge_logits[mask_logits]
-                    labeled_labels = batch.edge_label[mask_labels]
+                    mask_labels = torch.isin(batch.input_id, batch.e_id)
+                    # Create a mask for the edges in the batch
+                    if self.args.split_mode == "inductive":
+                        mask_logits = torch.isin(batch.e_id, split_edge_indices[batch.input_id])
+                        # Create a mask for the labels
+                        mask_labels = torch.isin(split_edge_indices[batch.input_id], batch.e_id)
+                    else:
+                        mask_logits = torch.isin(batch.e_id, split_edge_indices[batch.input_id])
+                        # Create a mask for the labels
+                        mask_labels = torch.isin(split_edge_indices[batch.input_id], batch.e_id)
 
-                    loss = self.default_loss_fn(labeled_logits, labeled_labels)
+                    # sanity checks
+                    assert mask_logits.sum() == mask_labels.sum(), f"mask_logits ({mask_logits.sum()}) sum should match mask_labels sum (P{mask_labels.sum()})"
+                    # if more than 10% of the edges are not in the mask, raise an error
+                    if mask_logits.sum() < 0.9 * batch.input_id.shape[0]:
+                        raise ValueError(f"More than 10% of the edges are not in the mask, {mask_logits.sum()} < {0.9 * batch.input_id.shape[0]}")
+
+                    # labeled_logits = edge_logits[mask_logits]
+                    # target_labels = batch.edge_label[mask_labels]
+                    # loss = self.default_loss_fn(labeled_logits, target_labels)
+
+                    # logits here are the logits for all edges in the graph, so we need to filter them using the mask
+                    labeled_logits = edge_logits[mask_logits]  # Get logits for the edges in the batch
+                    target_labels = batch.edge_label[mask_labels].unsqueeze(1) # Get labels for the edges in the batc, as floats
+                    # TODO use self.loss_fn instead of default_loss_fn
+                    loss, pred = self.default_loss_fn(labeled_logits, target_labels)
+
+                    # print(f"in batch {batchidx+1}/{len(loader)}, there are {target_labels.sum()} positive examples and {pred.sum()} predicted positive examples.")
 
                     eval_output[f"loss_{split}"] += loss.item()
 
@@ -228,7 +333,7 @@ class EdgeClsTask(BaseTask):
                     metrics = compute_supervised_metrics(
                         metrics=self.args.metrics,
                         logits=labeled_logits,
-                        labels=labeled_labels,
+                        labels=target_labels,
                         suffix=split,
                     )
 
@@ -328,7 +433,8 @@ class EdgeClsTask(BaseTask):
             self.args,
             input_dim_node=self.num_feats[0],
             input_dim_edge=self.num_feats[1],
-            output_dim=self.num_global_classes,
+            # output_dim=self.num_global_classes,
+            output_dim=1,
             client_id=self.client_id
         )
         print(f"loaded model: {model}")
@@ -364,7 +470,6 @@ class EdgeClsTask(BaseTask):
         Returns:
             int: Number of features.
         """
-        print(self.data.keys())
         return self.data.x.shape[1], self.data.edge_attr.shape[1]
 
     @property
@@ -388,9 +493,22 @@ class EdgeClsTask(BaseTask):
         if self.args.dp_mech != "no_dp":
             return nn.CrossEntropyLoss(reduction="none")
         else:
-            # TODO parametrize this
-            # return nn.BCEWithLogitsLoss(weight=torch.tensor([1,7], device=self.device))
-            return nn.CrossEntropyLoss(weight=torch.tensor([1, 7], device=self.device, dtype=torch.float32))
+            # return nn.BCEWithLogitsLoss(weight=torch.tensor([1,7], device=self.device, dtype=torch.float32))
+            # return nn.CrossEntropyLoss(weight=torch.tensor([7], device=self.device, dtype=torch.float32))
+            def weighted_cross_entropy(pred, true):
+                """Weighted cross-entropy for unbalanced classes."""
+                weight = torch.tensor([1,7], device=torch.device(self.device), dtype=torch.float32) # TODO parametrize this
+                # multiclass
+                if self.num_global_classes > 2:
+                    pred = F.log_softmax(pred, dim=-1)
+                    return F.nll_loss(pred, true, weight=weight), pred
+                # binary
+                else:
+                    loss = F.binary_cross_entropy_with_logits(pred, true.float(),
+                                                                weight=weight[true])
+                    return loss, torch.sigmoid(pred)
+
+            return weighted_cross_entropy
 
     @property
     def default_train_val_test_split(self):
@@ -432,7 +550,7 @@ class EdgeClsTask(BaseTask):
 
     def load_train_val_test_split(self):
         """
-        Load the train/validation/test split from a file.
+        Load the train/validation/test split from a file, or create it if it does not exist.
         """
         # here we do the split
         # if no file, we call the local_subgraph_train_val_test_split method
@@ -444,10 +562,10 @@ class EdgeClsTask(BaseTask):
             glb_test = []
             
             for client_id in range(self.args.num_clients):
-                glb_train_path = osp.join(self.train_val_test_path, f"glb_train_{client_id}.pkl")
-                glb_val_path = osp.join(self.train_val_test_path, f"glb_val_{client_id}.pkl")
-                glb_test_path = osp.join(self.train_val_test_path, f"glb_test_{client_id}.pkl")
-                
+                glb_train_path = osp.join(self.train_val_test_path, f"glb_train_{client_id}_{self.args.split_mode}.pkl")
+                glb_val_path = osp.join(self.train_val_test_path, f"glb_val_{client_id}_{self.args.split_mode}.pkl")
+                glb_test_path = osp.join(self.train_val_test_path, f"glb_test_{client_id}_{self.args.split_mode}.pkl")
+
                 with open(glb_train_path, 'rb') as file:
                     glb_train_data = pickle.load(file)
                     glb_train += glb_train_data
@@ -465,13 +583,13 @@ class EdgeClsTask(BaseTask):
             test_mask = idx_to_mask_tensor(glb_test, self.num_samples).bool()
             
         else: # client
-            train_path = osp.join(self.train_val_test_path, f"train_{self.client_id}.pt")
-            val_path = osp.join(self.train_val_test_path, f"val_{self.client_id}.pt")
-            test_path = osp.join(self.train_val_test_path, f"test_{self.client_id}.pt")
-            glb_train_path = osp.join(self.train_val_test_path, f"glb_train_{self.client_id}.pkl")
-            glb_val_path = osp.join(self.train_val_test_path, f"glb_val_{self.client_id}.pkl")
-            glb_test_path = osp.join(self.train_val_test_path, f"glb_test_{self.client_id}.pkl")
-            
+            train_path = osp.join(self.train_val_test_path, f"train_{self.client_id}_{self.args.split_mode}.pt")
+            val_path = osp.join(self.train_val_test_path, f"val_{self.client_id}_{self.args.split_mode}.pt")
+            test_path = osp.join(self.train_val_test_path, f"test_{self.client_id}_{self.args.split_mode}.pt")
+            glb_train_path = osp.join(self.train_val_test_path, f"glb_train_{self.client_id}_{self.args.split_mode}.pkl")
+            glb_val_path = osp.join(self.train_val_test_path, f"glb_val_{self.client_id}_{self.args.split_mode}.pkl")
+            glb_test_path = osp.join(self.train_val_test_path, f"glb_test_{self.client_id}_{self.args.split_mode}.pkl")
+
             # if the file exists, we load it
             if osp.exists(train_path) and osp.exists(val_path) and osp.exists(test_path)\
                 and osp.exists(glb_train_path) and osp.exists(glb_val_path) and osp.exists(glb_test_path): 
@@ -480,8 +598,13 @@ class EdgeClsTask(BaseTask):
                 test_mask = torch.load(test_path)
             # otherwise, we do the split
             else:
-                train_mask, val_mask, test_mask = self.local_subgraph_train_val_test_split(self.data, self.args.train_val_test)
-                
+                if self.args.split_mode == "inductive":
+                    train_mask, val_mask, test_mask = self.local_subgraph_train_val_test_split_inductive(self.data, self.args.train_val_test)
+                elif self.args.split_mode == "transductive":
+                    train_mask, val_mask, test_mask = self.local_subgraph_train_val_test_split_transductive(self.data, self.args.train_val_test)
+                else:
+                    raise ValueError(f"Unknown split mode: {self.args.split_mode}. Supported modes are 'inductive' and 'transductive'.")
+
                 if not osp.exists(self.train_val_test_path):
                     os.makedirs(self.train_val_test_path)
                     
@@ -527,7 +650,78 @@ class EdgeClsTask(BaseTask):
         self.processed_data = processing(args=self.args, splitted_data=self.splitted_data, processed_dir=self.data_dir, client_id=self.client_id)
 
 
-    def local_subgraph_train_val_test_split(self, local_subgraph, split: str, shuffle=True):
+    def local_subgraph_train_val_test_split_inductive(self, local_subgraph, split: str):
+        """
+        Split the local subgraph into train, validation, and test sets for inductive learning.
+
+        Args:
+            local_subgraph (object): Local subgraph to be split.
+                - expects a 'timestamps' attribute with the edges
+            split (str or tuple): Split ratios or default split identifier.
+            shuffle (bool, optional): If True, shuffle the subgraph before splitting. Defaults to True.
+
+        Returns:
+            tuple: Masks for the train, validation, and test sets.
+        """
+        assert hasattr(local_subgraph, 'timestamps'), "local_subgraph must have a 'timestamps' attribute for inductive learning."
+        num_edges = local_subgraph.y.shape[0]
+        assert num_edges == local_subgraph.timestamps.shape[0], "Number of edges must match number of timestamps."
+        # make sure timestamps are sorted
+        assert torch.all(local_subgraph.timestamps[:-1] <= local_subgraph.timestamps[1:]), "Timestamps must be sorted in ascending order."
+
+        if split == "default_split":
+            train_, val_, test_ = self.default_train_val_test_split
+        else:
+            if isinstance(split, str):
+               train_, val_, test_ = extract_floats(split)
+            elif isinstance(split, iterable) and len(split) == 3:
+                train_, val_, test_ = split
+                assert train_ + val_ + test_ <= 1, "The sum of train, val, and test split should be <= 1"
+            else:
+                raise ValueError(f"Invalid split: {split}. Expected a string or a tuple of three floats.")
+        
+        # if cross-edges, the split should only consider the edges which have a source in the local subgraph
+        if self.args.with_crossedges:
+            assert hasattr(local_subgraph, 'external_nodes'), "local_subgraph must have a 'source_mask' attribute for cross-edges."
+            print(f"external nodes: {len(local_subgraph.external_nodes)}")
+            local_edges_mask = ~torch.isin(local_subgraph.edge_index[1], local_subgraph.external_nodes)
+            print(f"local edges mask: {local_edges_mask.sum()} edges in the local subgraph")
+        else:
+            local_edges_mask = torch.ones(num_edges, dtype=torch.bool)
+
+        # get differentiating timestamps
+        t_1 = local_subgraph.timestamps[local_edges_mask][int(train_ * local_edges_mask.sum())]
+        t_2 = local_subgraph.timestamps[local_edges_mask][int((train_ + val_) * local_edges_mask.sum())]
+
+        # make sure t_1 and t_2 are not the same
+        assert t_1 < t_2, "t_1 must be less than t_2 for inductive learning."
+
+        # train mask is edges with timestamps < t_1, and in local_edge_mask (= ones if no cross-edges)
+        train_mask = (local_subgraph.timestamps < t_1) & local_edges_mask
+        # val mask is edges with timestamps >= t_1 and < t_2
+        val_mask = (local_subgraph.timestamps >= t_1) & (local_subgraph.timestamps < t_2) & local_edges_mask
+        # test mask is edges with timestamps >= t_2
+        test_mask = (local_subgraph.timestamps >= t_2) & local_edges_mask
+
+        train_mask = train_mask.bool()
+        val_mask = val_mask.bool()
+        test_mask = test_mask.bool()
+
+        # sanity checks
+        assert train_mask.sum() + val_mask.sum() + test_mask.sum() == local_edges_mask.sum()
+
+        # make sure that the masks are not empty
+        assert train_mask.sum() > 0, "Train mask is empty. No edges in the training set."
+        assert val_mask.sum() > 0, "Validation mask is empty. No edges in the validation set."
+        assert test_mask.sum() > 0, "Test mask is empty. No edges in the test set."
+
+        print(type(train_mask), type(val_mask), type(test_mask))
+        print(f"train_mask: {train_mask.sum()}, val_mask: {val_mask.sum()}, test_mask: {test_mask.sum()}")
+
+        return train_mask, val_mask, test_mask
+    
+
+    def local_subgraph_train_val_test_split_transductive(self, local_subgraph, split: str, shuffle=True):
         """
         Split the local subgraph into train, validation, and test sets based on the edges.
 
@@ -556,8 +750,11 @@ class EdgeClsTask(BaseTask):
         val_mask = idx_to_mask_tensor([], num_edges)
         test_mask = idx_to_mask_tensor([], num_edges)
 
+        # TODO account for cross-edges here
+        if self.args.with_crossedges:
+            raise NotImplementedError("Cross-edges are not supported for transductive edge classification. Please set args.with_crossedges to False.")
+
         # stratified split 
-        # TODO this does not make a lot of sense for AML, we need to do a split based on timestamps, instead of transductive
         for class_i in range(local_subgraph.num_global_classes):
             class_i_edge_mask = local_subgraph.y == class_i
             num_class_i_edges = class_i_edge_mask.sum()
@@ -574,5 +771,9 @@ class EdgeClsTask(BaseTask):
         val_mask = val_mask.bool()
         test_mask = test_mask.bool()
 
+        print(type(train_mask), type(val_mask), type(test_mask))
+        print(f"train_mask: {train_mask.sum()}, val_mask: {val_mask.sum()}, test_mask: {test_mask.sum()}")
+
         return train_mask, val_mask, test_mask
-    
+
+

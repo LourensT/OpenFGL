@@ -102,25 +102,30 @@ def get_subgraph_pyg_data(global_dataset, node_list, with_crossedges=False):
             x=global_dataset.x[node_list],
             edge_index=local_edge_index, 
             edge_attr=global_dataset.edge_attr[local_edge_ids], 
-            y=new_y
+            y=new_y, 
+            timestamps=global_dataset.timestamps[local_edge_ids] # for inductive learning
         )
     else:
         local_subgraph = Data(
             x=global_dataset.x[node_list], 
             edge_index=local_edge_index, 
-            y=new_y
+            y=new_y,
         )
 
     local_subgraph.global_map = local_id_to_global_id
     local_subgraph.global_edge_map = {i : edge_id for i, edge_id in enumerate(local_edge_ids)}
 
     if with_crossedges:
-        local_subgraph.external_nodes = external_nodes_list
+        external_nodes = torch.tensor(external_nodes_list)
+        local_subgraph.external_nodes = external_nodes
     
     if hasattr(global_dataset, "num_classes"):
         local_subgraph.num_global_classes = global_dataset.num_classes
     else:
         local_subgraph.num_global_classes = global_dataset.num_global_classes
+    
+    # TODO clean up this method
+
     return local_subgraph
 
 

@@ -29,7 +29,8 @@ class AMLDataset(InMemoryDataset):
             x=hetdata['node']['x'], 
             edge_index=hetdata['node','to','node']['edge_index'], 
             edge_attr=hetdata['node','to','node']['edge_attr'],
-            y = hetdata['node', 'to', 'node']['y']
+            timestamps=hetdata['node','to','node']['timestamps'],
+            y=hetdata['node', 'to', 'node']['y']
         )
 
     @property
